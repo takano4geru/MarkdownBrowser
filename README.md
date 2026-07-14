@@ -72,25 +72,48 @@ dist/markdown_browser-macos-vX.Y.Z-unsigned.zip
 
 このZIPは署名・notarizationされていません。一般配布を本格化する場合は、Apple Developer IDによる署名、Hardened Runtime、notarization、stapleを行うことを推奨します。
 
-## ローカル保存
+## ワークスペースとローカル保存
 
-ツールバーのフォルダボタンから保存先フォルダを選び、`Save`を押すと現在のMarkdownを保存します。
+ツールバーのフォルダボタンから固定ワークスペースを選び、`Save`を押すと現在のMarkdownを保存します。iCloud Drive、Google Drive、Dropboxなどの同期フォルダをワークスペースに選ぶことで、アプリ固有のクラウドAPIを使わずにデータを同期できます。
 
-`All local`を有効にすると、取得可能な画像をMarkdownファイル横のアセットフォルダへ保存し、Markdown内の画像リンクをローカル相対パスへ書き換えます。
+初回選択時に以下の構成を作成します。
+
+```text
+MarkdownBrowser/
+├── Articles/
+│   ├── article.md
+│   └── article_assets/
+└── MarkdownBrowser Data/
+    ├── workspace.json
+    ├── bookmarks/
+    ├── history/
+    └── devices/
+```
+
+- Markdownと画像は`Articles`へ保存します。
+- ブックマークは1件ずつ独立したJSONとして保存し、クラウド競合を抑えます。
+- 履歴は端末別JSONへ保存し、端末間で同じファイルを同時編集しない構成です。
+- ホームページと`Local images`設定は`workspace.json`へ保存します。
+- Cookie、WebViewキャッシュ、ログイン状態はワークスペースへ保存しません。
+- macOSではSecurity-Scoped Bookmarkを使い、再起動後に選択済みワークスペースへのアクセス権を復元します。
+
+`Local images`を有効にすると、取得可能な画像をMarkdownファイル横のアセットフォルダへ保存し、Markdown内の画像リンクをローカル相対パスへ書き換えます。
+
+既存のMarkdownファイルを後から画像ローカル化する場合は、データ操作画面の`Localize Markdown images`を使用します。
 
 認証が必要な画像、ホットリンクを拒否する画像、JavaScriptで動的生成される画像は保存できない場合があります。その場合は元URLを維持します。
 
 ## アプリ内データ
 
-以下のデータは、`path_provider`で取得されるアプリ用データ領域に保存されます。macOSではApplication Support配下です。
+Application Supportにはワークスペースを復元するためのローカル設定と互換用データも保持します。共有対象のブックマーク、履歴、ホームページ、保存設定はワークスペース側にも保存されます。
 
 - 履歴
 - ブックマーク
 - ホームページURL
-- 最後に使った保存先フォルダ
-- `All local`設定
+- 最後に使ったワークスペースの復元情報
+- `Local images`設定
 
-ツールバーのデータ操作ボタンから、履歴、ブックマーク、セッション内の保存済み一覧、保存先フォルダ設定、WebViewデータを削除できます。
+ツールバーのデータ操作ボタンから、履歴、ブックマーク、保存済み一覧、ワークスペース設定、WebViewデータを削除できます。
 
 WebViewデータを削除するとCookie、キャッシュ、LocalStorageが消えるため、ログイン済みサービスでは再ログインが必要になる場合があります。ユーザーが保存したMarkdownファイルや画像アセットは削除されません。
 

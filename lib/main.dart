@@ -1,8 +1,10 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html_parser;
@@ -102,6 +104,8 @@ class BrowserTab {
     required this.title,
     this.currentUrl = '',
     this.document,
+    this.savedMarkdown,
+    this.savedFilePath,
     this.viewMode = ViewMode.markdown,
   });
 
@@ -109,7 +113,11 @@ class BrowserTab {
   String title;
   String currentUrl;
   PageDocument? document;
+  String? savedMarkdown;
+  String? savedFilePath;
   ViewMode viewMode;
+
+  String get displayedMarkdown => savedMarkdown ?? document?.markdown ?? '';
 }
 
 enum LibrarySection {
@@ -153,10 +161,127 @@ class PageLinkEntry {
   }
 }
 
+class SavedPageEntry {
+  const SavedPageEntry({
+    required this.url,
+    required this.title,
+    required this.contentHash,
+    required this.localizedContentHash,
+    required this.filePath,
+    required this.savedAt,
+    required this.allLocal,
+  });
+
+  final String url;
+  final String title;
+  final String contentHash;
+  final String localizedContentHash;
+  final String filePath;
+  final DateTime savedAt;
+  final bool allLocal;
+
+  factory SavedPageEntry.fromJson(Object? value) {
+    if (value is! Map) {
+      return SavedPageEntry(
+        url: '',
+        title: '',
+        contentHash: '',
+        localizedContentHash: '',
+        filePath: '',
+        savedAt: DateTime.fromMillisecondsSinceEpoch(0),
+        allLocal: false,
+      );
+    }
+    final json = Map<String, Object?>.from(value);
+    return SavedPageEntry(
+      url: json['url'] is String ? json['url'] as String : '',
+      title: json['title'] is String ? json['title'] as String : '',
+      contentHash: json['contentHash'] is String
+          ? json['contentHash'] as String
+          : '',
+      localizedContentHash: json['localizedContentHash'] is String
+          ? json['localizedContentHash'] as String
+          : '',
+      filePath: json['filePath'] is String ? json['filePath'] as String : '',
+      savedAt:
+          DateTime.tryParse(
+            json['savedAt'] is String ? json['savedAt'] as String : '',
+          ) ??
+          DateTime.fromMillisecondsSinceEpoch(0),
+      allLocal: json['allLocal'] is bool ? json['allLocal'] as bool : false,
+    );
+  }
+
+  Map<String, Object?> toJson() => <String, Object?>{
+    'url': url,
+    'title': title,
+    'contentHash': contentHash,
+    'localizedContentHash': localizedContentHash,
+    'filePath': filePath,
+    'savedAt': savedAt.toIso8601String(),
+    'allLocal': allLocal,
+  };
+}
+
+class SavedPageContentStore {
+  static File markdownFile(SavedPageEntry entry) => File(entry.filePath);
+
+  static Directory assetDirectory(SavedPageEntry entry) {
+    final file = markdownFile(entry);
+    final fileName = file.path.split(Platform.pathSeparator).last;
+    final baseName = fileName.replaceFirst(
+      RegExp(r'\.(md|markdown)$', caseSensitive: false),
+      '',
+    );
+    return Directory(
+      '${file.parent.path}${Platform.pathSeparator}${baseName}_assets',
+    );
+  }
+
+  static Future<List<String>> existingPaths(SavedPageEntry entry) async {
+    if (entry.filePath.trim().isEmpty) return const <String>[];
+    final paths = <String>[];
+    final markdown = markdownFile(entry);
+    final assets = assetDirectory(entry);
+    if (await _existsBestEffort(markdown)) paths.add(markdown.path);
+    if (await _existsBestEffort(assets)) paths.add(assets.path);
+    return paths;
+  }
+
+  static Future<bool> _existsBestEffort(FileSystemEntity entity) async {
+    try {
+      return await entity.exists();
+    } on FileSystemException {
+      // An unavailable or previously removed parent folder must not prevent
+      // the saved-page entry itself from being removed from the app.
+      return false;
+    }
+  }
+
+  static Future<void> deleteIfPresent(SavedPageEntry entry) async {
+    if (entry.filePath.trim().isEmpty) return;
+    await _deleteIfPresent(markdownFile(entry));
+    await _deleteIfPresent(assetDirectory(entry));
+  }
+
+  static Future<void> _deleteIfPresent(FileSystemEntity entity) async {
+    try {
+      if (await entity.exists()) {
+        await entity.delete(recursive: entity is Directory);
+      }
+    } on FileSystemException {
+      // A user or a sync process may remove the target between the existence
+      // check and deletion. That already satisfies the requested outcome.
+      if (await entity.exists()) rethrow;
+    }
+  }
+}
+
 class PersistedAppState {
   const PersistedAppState({
     required this.bookmarks,
     required this.history,
+    required this.savedPages,
     required this.lastSaveDirectory,
     required this.homePageUrl,
     required this.saveAllLocally,
@@ -164,6 +289,7 @@ class PersistedAppState {
 
   final List<PageLinkEntry> bookmarks;
   final List<PageLinkEntry> history;
+  final List<SavedPageEntry> savedPages;
   final String? lastSaveDirectory;
   final String homePageUrl;
   final bool saveAllLocally;
@@ -172,6 +298,7 @@ class PersistedAppState {
     return const PersistedAppState(
       bookmarks: <PageLinkEntry>[],
       history: <PageLinkEntry>[],
+      savedPages: <SavedPageEntry>[],
       lastSaveDirectory: null,
       homePageUrl: defaultHomePageUrl,
       saveAllLocally: true,
@@ -186,6 +313,7 @@ class PersistedAppState {
     return PersistedAppState(
       bookmarks: _pageLinkList(json['bookmarks']),
       history: _pageLinkList(json['history']),
+      savedPages: _savedPageList(json['savedPages']),
       lastSaveDirectory: settings['lastSaveDirectory'] is String
           ? settings['lastSaveDirectory'] as String
           : null,
@@ -200,9 +328,10 @@ class PersistedAppState {
 
   Map<String, Object?> toJson() {
     return <String, Object?>{
-      'version': 1,
+      'version': 2,
       'bookmarks': bookmarks.map((bookmark) => bookmark.toJson()).toList(),
       'history': history.map((entry) => entry.toJson()).toList(),
+      'savedPages': savedPages.map((entry) => entry.toJson()).toList(),
       'settings': <String, Object?>{
         'lastSaveDirectory': lastSaveDirectory,
         'homePageUrl': homePageUrl,
@@ -218,6 +347,14 @@ class PersistedAppState {
     return value
         .map(PageLinkEntry.fromJson)
         .where((entry) => entry.url.isNotEmpty)
+        .toList();
+  }
+
+  static List<SavedPageEntry> _savedPageList(Object? value) {
+    if (value is! List<Object?>) return <SavedPageEntry>[];
+    return value
+        .map(SavedPageEntry.fromJson)
+        .where((entry) => entry.url.isNotEmpty && entry.contentHash.isNotEmpty)
         .toList();
   }
 }
@@ -252,6 +389,210 @@ class AppStateStore {
   }
 }
 
+class WorkspaceAccess {
+  static const MethodChannel _channel = MethodChannel(
+    'markdown_browser/workspace',
+  );
+
+  static Future<String?> restore() async {
+    if (!Platform.isMacOS) return null;
+    try {
+      return await _channel.invokeMethod<String>('resolveBookmark');
+    } on PlatformException {
+      return null;
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
+  static Future<String?> choose() async {
+    if (!Platform.isMacOS) {
+      return getDirectoryPath(confirmButtonText: 'Use workspace');
+    }
+    return _channel.invokeMethod<String>('chooseWorkspace');
+  }
+
+  static Future<void> remember(String path) async {
+    if (!Platform.isMacOS) return;
+    await _channel.invokeMethod<String>('saveBookmark', <String, String>{
+      'path': path,
+    });
+  }
+
+  static Future<void> forget() async {
+    if (!Platform.isMacOS) return;
+    try {
+      await _channel.invokeMethod<void>('clearBookmark');
+    } on PlatformException {
+      // The local path setting is still cleared if the native bookmark is gone.
+    }
+  }
+}
+
+class WorkspaceData {
+  const WorkspaceData({
+    required this.bookmarks,
+    required this.history,
+    required this.homePageUrl,
+    required this.saveAllLocally,
+  });
+
+  final List<PageLinkEntry> bookmarks;
+  final List<PageLinkEntry> history;
+  final String? homePageUrl;
+  final bool? saveAllLocally;
+}
+
+class WorkspaceStore {
+  WorkspaceStore._(this.rootPath);
+
+  final String rootPath;
+
+  String get articlesPath => '$rootPath/Articles';
+  String get dataPath => '$rootPath/MarkdownBrowser Data';
+  String get bookmarksPath => '$dataPath/bookmarks';
+  String get historyPath => '$dataPath/history';
+  String get devicesPath => '$dataPath/devices';
+  String get deviceId {
+    final host = Platform.localHostname.trim().isEmpty
+        ? 'device'
+        : Platform.localHostname.trim();
+    return sha256.convert(utf8.encode(host)).toString().substring(0, 12);
+  }
+
+  static Future<WorkspaceStore> open(String rootPath) async {
+    final store = WorkspaceStore._(rootPath);
+    for (final path in <String>[
+      store.articlesPath,
+      store.bookmarksPath,
+      store.historyPath,
+      store.devicesPath,
+    ]) {
+      await Directory(path).create(recursive: true);
+    }
+    final manifest = File('${store.dataPath}/workspace.json');
+    if (!await manifest.exists()) {
+      await store._writeJson(manifest, <String, Object?>{
+        'version': 1,
+        'createdAt': DateTime.now().toUtc().toIso8601String(),
+        'settings': <String, Object?>{},
+      });
+    }
+    await store._writeJson(
+      File('${store.devicesPath}/${store.deviceId}.json'),
+      <String, Object?>{
+        'id': store.deviceId,
+        'name': Platform.localHostname,
+        'platform': Platform.operatingSystem,
+        'lastSeenAt': DateTime.now().toUtc().toIso8601String(),
+      },
+    );
+    return store;
+  }
+
+  Future<void> verifyWritable() async {
+    final probe = File(
+      '$dataPath/.write-test-${DateTime.now().microsecondsSinceEpoch}',
+    );
+    try {
+      await probe.writeAsString('ok', flush: true);
+    } finally {
+      if (await probe.exists()) await probe.delete();
+    }
+  }
+
+  Future<WorkspaceData> load() async {
+    final bookmarks = <PageLinkEntry>[];
+    await for (final entity in Directory(bookmarksPath).list()) {
+      if (entity is! File || !entity.path.endsWith('.json')) continue;
+      try {
+        final decoded = jsonDecode(await entity.readAsString());
+        final entry = PageLinkEntry.fromJson(decoded);
+        if (entry.url.isNotEmpty) bookmarks.add(entry);
+      } catch (_) {
+        // A cloud conflict or partial file must not prevent workspace loading.
+      }
+    }
+
+    final historyByUrl = <String, PageLinkEntry>{};
+    await for (final entity in Directory(historyPath).list()) {
+      if (entity is! File || !entity.path.endsWith('.json')) continue;
+      try {
+        final decoded = jsonDecode(await entity.readAsString());
+        if (decoded is! List) continue;
+        for (final value in decoded) {
+          final entry = PageLinkEntry.fromJson(value);
+          if (entry.url.isNotEmpty) historyByUrl[entry.url] = entry;
+        }
+      } catch (_) {
+        // Other device history remains optional when a file is conflicted.
+      }
+    }
+
+    String? homePageUrl;
+    bool? saveAllLocally;
+    try {
+      final decoded = jsonDecode(
+        await File('$dataPath/workspace.json').readAsString(),
+      );
+      if (decoded is Map) {
+        final settings = decoded['settings'];
+        if (settings is Map) {
+          homePageUrl = settings['homePageUrl'] as String?;
+          saveAllLocally = settings['saveAllLocally'] as bool?;
+        }
+      }
+    } catch (_) {
+      // Defaults and local bootstrap settings remain available.
+    }
+    return WorkspaceData(
+      bookmarks: bookmarks,
+      history: historyByUrl.values.toList(),
+      homePageUrl: homePageUrl,
+      saveAllLocally: saveAllLocally,
+    );
+  }
+
+  Future<void> save({
+    required List<PageLinkEntry> bookmarks,
+    required List<PageLinkEntry> history,
+    required String homePageUrl,
+    required bool saveAllLocally,
+  }) async {
+    final desiredBookmarkFiles = <String>{};
+    for (final bookmark in bookmarks) {
+      final name = '${sha256.convert(utf8.encode(bookmark.url))}.json';
+      desiredBookmarkFiles.add(name);
+      await _writeJson(File('$bookmarksPath/$name'), bookmark.toJson());
+    }
+    await for (final entity in Directory(bookmarksPath).list()) {
+      if (entity is File &&
+          entity.path.endsWith('.json') &&
+          !desiredBookmarkFiles.contains(entity.uri.pathSegments.last)) {
+        await entity.delete();
+      }
+    }
+    await _writeJson(
+      File('$historyPath/$deviceId.json'),
+      history.map((entry) => entry.toJson()).toList(),
+    );
+    await _writeJson(File('$dataPath/workspace.json'), <String, Object?>{
+      'version': 1,
+      'updatedAt': DateTime.now().toUtc().toIso8601String(),
+      'settings': <String, Object?>{
+        'homePageUrl': homePageUrl,
+        'saveAllLocally': saveAllLocally,
+      },
+    });
+  }
+
+  Future<void> _writeJson(File file, Object value) async {
+    await file.parent.create(recursive: true);
+    const encoder = JsonEncoder.withIndent('  ');
+    await file.writeAsString(encoder.convert(value), flush: true);
+  }
+}
+
 class BrowserWorkspace extends StatefulWidget {
   const BrowserWorkspace({super.key, required this.enableNativeWebView});
 
@@ -272,10 +613,12 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   final List<BrowserTab> _tabs = <BrowserTab>[
     BrowserTab(id: 'tab-1', title: 'New page'),
   ];
-  final List<PageDocument> _savedPages = <PageDocument>[];
+  final List<SavedPageEntry> _savedPages = <SavedPageEntry>[];
   final List<PageLinkEntry> _history = <PageLinkEntry>[];
   final List<PageLinkEntry> _bookmarks = <PageLinkEntry>[];
   WebViewController? _webViewController;
+  WorkspaceStore? _workspace;
+  String? _workspaceRoot;
   String? _localSaveDirectory;
   String _homePageUrl = defaultHomePageUrl;
   int _activeIndex = 0;
@@ -323,7 +666,9 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         _history
           ..clear()
           ..addAll(state.history.take(_maxHistoryItems));
-        _localSaveDirectory = state.lastSaveDirectory;
+        _savedPages
+          ..clear()
+          ..addAll(state.savedPages);
         _homePageUrl = _normalizeAddress(state.homePageUrl);
         _homePageController.text = _homePageUrl;
         _saveAllLocally = state.saveAllLocally;
@@ -339,6 +684,50 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         _statusMessage = 'Could not load app state: $error';
       });
     }
+    final restoredWorkspace = await WorkspaceAccess.restore();
+    if (restoredWorkspace != null) {
+      try {
+        final workspace = await WorkspaceStore.open(restoredWorkspace);
+        final data = await workspace.load();
+        if (!mounted) return;
+        setState(() {
+          _workspace = workspace;
+          _workspaceRoot = restoredWorkspace;
+          _localSaveDirectory = workspace.articlesPath;
+          if (data.bookmarks.isNotEmpty) {
+            _bookmarks
+              ..clear()
+              ..addAll(data.bookmarks);
+          }
+          if (data.history.isNotEmpty) {
+            _history
+              ..clear()
+              ..addAll(data.history.take(_maxHistoryItems));
+          }
+          if (data.homePageUrl != null) {
+            _homePageUrl = _normalizeAddress(data.homePageUrl!);
+            _homePageController.text = _homePageUrl;
+          }
+          if (data.saveAllLocally != null) {
+            _saveAllLocally = data.saveAllLocally!;
+          }
+          _statusMessage = 'Workspace restored: $restoredWorkspace';
+        });
+      } catch (error) {
+        if (mounted) {
+          setState(() {
+            _workspace = null;
+            _workspaceRoot = null;
+            _localSaveDirectory = null;
+            _statusMessage = 'Workspace could not be restored: $error';
+          });
+        }
+      }
+    }
+    if (_workspace != null) {
+      await _persistAppState();
+    }
+    await _discoverSavedPages();
     if (mounted) {
       await _openHomePage(loadWebView: widget.enableNativeWebView);
     }
@@ -350,10 +739,17 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         PersistedAppState(
           bookmarks: _bookmarks,
           history: _history.take(_maxHistoryItems).toList(),
-          lastSaveDirectory: _localSaveDirectory,
+          savedPages: _savedPages,
+          lastSaveDirectory: _workspaceRoot,
           homePageUrl: _homePageUrl,
           saveAllLocally: _saveAllLocally,
         ),
+      );
+      await _workspace?.save(
+        bookmarks: _bookmarks,
+        history: _history.take(_maxHistoryItems).toList(),
+        homePageUrl: _homePageUrl,
+        saveAllLocally: _saveAllLocally,
       );
     } catch (error) {
       if (!mounted) {
@@ -533,6 +929,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         ..currentUrl = url
         ..title = 'Home'
         ..document = null
+        ..savedMarkdown = null
+        ..savedFilePath = null
         ..viewMode = ViewMode.web;
       _addressController.text = url;
       _markdownController.clear();
@@ -614,6 +1012,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       );
       final rawHtml = _javascriptStringResult(result);
       final document = _convertHtml(url, rawHtml);
+      final savedArtifact = await _readSavedArtifact(url);
       if (!mounted) {
         return;
       }
@@ -626,11 +1025,13 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         _activeTab
           ..currentUrl = url
           ..title = document.metadata.title
-          ..document = document;
+          ..document = document
+          ..savedMarkdown = savedArtifact?.markdown
+          ..savedFilePath = savedArtifact?.filePath;
         _canGoBack = false;
         _canGoForward = false;
         _recordHistory(url, document.metadata.title);
-        _markdownController.text = document.markdown;
+        _markdownController.text = _activeTab.displayedMarkdown;
         _isLoading = false;
         _statusMessage = 'Loaded and converted ${document.metadata.title}';
       });
@@ -645,6 +1046,74 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         _statusMessage = 'Loaded page, but HTML extraction failed: $error';
       });
     }
+  }
+
+  Future<({String markdown, String filePath})?> _readSavedArtifact(
+    String url,
+  ) async {
+    SavedPageEntry? entry;
+    for (final candidate in _savedPages) {
+      if (candidate.url == url) {
+        entry = candidate;
+        break;
+      }
+    }
+    if (entry == null || entry.filePath.isEmpty) return null;
+    final file = File(entry.filePath);
+    if (!await file.exists()) return null;
+    try {
+      final contents = await file.readAsString();
+      return (markdown: _markdownBody(contents), filePath: entry.filePath);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _openSavedPage(SavedPageEntry entry) async {
+    final artifact = await _readSavedArtifact(entry.url);
+    if (artifact == null || !mounted) {
+      setState(() {
+        _statusMessage = 'Saved Markdown file could not be opened.';
+      });
+      return;
+    }
+    final document = PageDocument(
+      url: entry.url,
+      rawHtml: '',
+      extractedText: artifact.markdown,
+      markdown: artifact.markdown,
+      metadata: PageMetadata(
+        title: entry.title,
+        description: '',
+        author: '',
+        published: '',
+        sourceUrl: entry.url,
+        siteName: 'Saved Markdown',
+      ),
+      outline: const <String>[],
+      links: const <String>[],
+      images: const <String>[],
+      warnings: const <String>[],
+    );
+    setState(() {
+      _activeTab
+        ..currentUrl = entry.url
+        ..title = entry.title
+        ..document = document
+        ..savedMarkdown = artifact.markdown
+        ..savedFilePath = artifact.filePath
+        ..viewMode = ViewMode.markdown;
+      _addressController.text = entry.url;
+      _markdownController.text = artifact.markdown;
+      _statusMessage = 'Opened saved Markdown: ${entry.filePath}';
+    });
+  }
+
+  static String _markdownBody(String contents) {
+    return contents.replaceFirst(
+      RegExp(r'^---\s*\n.*?\n---\s*\n', dotAll: true),
+      '',
+    );
   }
 
   String _javascriptStringResult(Object result) {
@@ -760,11 +1229,10 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   }
 
   Future<void> _selectTab(int index) async {
-    final document = _tabs[index].document;
     setState(() {
       _activeIndex = index;
       _addressController.text = _activeTab.currentUrl;
-      _markdownController.text = document?.markdown ?? '';
+      _markdownController.text = _activeTab.displayedMarkdown;
       _canGoBack = false;
       _canGoForward = false;
     });
@@ -791,7 +1259,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         }
       }
       _addressController.text = _activeTab.currentUrl;
-      _markdownController.text = _activeTab.document?.markdown ?? '';
+      _markdownController.text = _activeTab.displayedMarkdown;
       _canGoBack = false;
       _canGoForward = false;
       _isLoading = false;
@@ -836,11 +1304,15 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   void _setViewMode(ViewMode mode) {
     setState(() {
       if (_activeTab.viewMode == ViewMode.editor) {
-        _activeTab.document?.markdown = _markdownController.text;
+        if (_activeTab.savedMarkdown != null) {
+          _activeTab.savedMarkdown = _markdownController.text;
+        } else {
+          _activeTab.document?.markdown = _markdownController.text;
+        }
       }
       _activeTab.viewMode = mode;
       if (mode == ViewMode.editor) {
-        _markdownController.text = _activeTab.document?.markdown ?? '';
+        _markdownController.text = _activeTab.displayedMarkdown;
       }
     });
   }
@@ -848,6 +1320,23 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   Future<void> _saveCurrentPage() async {
     final document = _activeTab.document;
     if (document == null) {
+      return;
+    }
+    final markdown = _markdownController.text.isEmpty
+        ? document.markdown
+        : _markdownController.text;
+    final contentHash = _contentHash(markdown);
+    final duplicate = _savedPages.any(
+      (page) =>
+          page.url == document.url &&
+          (!_saveAllLocally || page.allLocal) &&
+          (page.contentHash == contentHash ||
+              page.localizedContentHash == contentHash),
+    );
+    if (duplicate) {
+      setState(() {
+        _statusMessage = 'Already saved: this page has not changed.';
+      });
       return;
     }
     if (_localSaveDirectory == null) {
@@ -868,10 +1357,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     });
 
     try {
-      document.markdown = _markdownController.text.isEmpty
-          ? document.markdown
-          : _markdownController.text;
-      final savedPath = await LocalMarkdownSaver.save(
+      document.markdown = markdown;
+      final result = await LocalMarkdownSaver.save(
         directoryPath: _localSaveDirectory!,
         document: document,
         markdown: document.markdown,
@@ -881,10 +1368,27 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         return;
       }
       setState(() {
+        _activeTab
+          ..savedMarkdown = result.markdown
+          ..savedFilePath = result.filePath;
+        _markdownController.text = result.markdown;
         _savedPages.removeWhere((page) => page.url == document.url);
-        _savedPages.insert(0, document);
+        _savedPages.insert(
+          0,
+          SavedPageEntry(
+            url: document.url,
+            title: document.metadata.title,
+            contentHash: contentHash,
+            localizedContentHash: _contentHash(result.markdown),
+            filePath: result.filePath,
+            savedAt: DateTime.now(),
+            allLocal: _saveAllLocally,
+          ),
+        );
         _isSavingLocal = false;
-        _statusMessage = 'Saved locally: $savedPath';
+        _statusMessage = result.localizedCount > 0
+            ? 'Saved locally: ${result.filePath} (${result.localizedCount} image links updated)'
+            : 'Saved locally: ${result.filePath}';
       });
       await _persistAppState();
     } catch (error) {
@@ -898,16 +1402,240 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     }
   }
 
+  Future<void> _localizeImagesInMarkdownFile() async {
+    final markdownFile = await openFile(
+      acceptedTypeGroups: const [
+        XTypeGroup(label: 'Markdown', extensions: <String>['md', 'markdown']),
+      ],
+      confirmButtonText: 'Select Markdown',
+    );
+    if (markdownFile == null || markdownFile.path.isEmpty) {
+      return;
+    }
+
+    setState(() {
+      _isSavingLocal = true;
+      _statusMessage = 'Collecting images for ${markdownFile.name}...';
+    });
+
+    try {
+      final result = await LocalMarkdownSaver.localizeMarkdownFileImages(
+        filePath: markdownFile.path,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        final document = _documentFromMarkdownFile(result);
+        _activeTab
+          ..currentUrl = Uri.file(result.filePath).toString()
+          ..title = result.fileName
+          ..document = document
+          ..savedMarkdown = result.markdown
+          ..savedFilePath = result.filePath
+          ..viewMode = ViewMode.editor;
+        _addressController.text = _activeTab.currentUrl;
+        _markdownController.text = result.markdown;
+        _isSavingLocal = false;
+        _statusMessage =
+            'Image collection complete: ${result.localizedCount}/${result.imageLinkCount} links updated in ${result.filePath}.';
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _isSavingLocal = false;
+        _statusMessage = 'Image collection failed: $error';
+      });
+    }
+  }
+
+  PageDocument _documentFromMarkdownFile(
+    MarkdownImageLocalizationResult result,
+  ) {
+    final fileUrl = Uri.file(result.filePath).toString();
+    return PageDocument(
+      url: fileUrl,
+      rawHtml: '',
+      extractedText: result.markdown,
+      markdown: result.markdown,
+      metadata: PageMetadata(
+        title: result.fileName,
+        description: '',
+        author: '',
+        published: '',
+        sourceUrl: fileUrl,
+        siteName: 'Local Markdown',
+      ),
+      outline: const <String>[],
+      links: const <String>[],
+      images: const <String>[],
+      warnings: const <String>[],
+    );
+  }
+
   Future<void> _chooseLocalFolder() async {
-    final path = await getDirectoryPath(confirmButtonText: 'Use folder');
+    String? path;
+    try {
+      path = await WorkspaceAccess.choose();
+    } on MissingPluginException {
+      path = await getDirectoryPath(confirmButtonText: 'Use workspace');
+    } on PlatformException catch (error) {
+      if (mounted) {
+        setState(() {
+          _statusMessage = 'Workspace permission failed: ${error.message}';
+        });
+      }
+      return;
+    }
     if (path == null || path.isEmpty) {
       return;
     }
-    setState(() {
-      _localSaveDirectory = path;
-      _statusMessage = 'Local save folder: $path';
-    });
+    try {
+      if (!Platform.isMacOS) await WorkspaceAccess.remember(path);
+      final workspace = await WorkspaceStore.open(path);
+      await workspace.verifyWritable();
+      final data = await workspace.load();
+      await _migrateSavedArticles(workspace);
+      if (!mounted) return;
+      setState(() {
+        _workspace = workspace;
+        _workspaceRoot = path;
+        _localSaveDirectory = workspace.articlesPath;
+        if (data.bookmarks.isNotEmpty) {
+          final byUrl = <String, PageLinkEntry>{
+            for (final entry in _bookmarks) entry.url: entry,
+            for (final entry in data.bookmarks) entry.url: entry,
+          };
+          _bookmarks
+            ..clear()
+            ..addAll(byUrl.values);
+        }
+        _statusMessage = 'Workspace: $path';
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _statusMessage = 'Workspace could not be opened: $error';
+      });
+      return;
+    }
+    await _discoverSavedPages();
     await _persistAppState();
+  }
+
+  Future<void> _migrateSavedArticles(WorkspaceStore workspace) async {
+    for (final saved in _savedPages) {
+      if (saved.filePath.isEmpty) continue;
+      final source = File(saved.filePath);
+      if (!await source.exists() ||
+          source.parent.path == workspace.articlesPath) {
+        continue;
+      }
+      final fileName = source.uri.pathSegments.last;
+      final destination = File('${workspace.articlesPath}/$fileName');
+      if (!await destination.exists()) {
+        await source.copy(destination.path);
+      }
+
+      final baseName = fileName.replaceFirst(
+        RegExp(r'\.(md|markdown)$', caseSensitive: false),
+        '',
+      );
+      final sourceAssets = Directory(
+        '${source.parent.path}/${baseName}_assets',
+      );
+      final destinationAssets = Directory(
+        '${workspace.articlesPath}/${baseName}_assets',
+      );
+      if (await sourceAssets.exists()) {
+        await _copyDirectory(sourceAssets, destinationAssets);
+      }
+    }
+  }
+
+  Future<void> _copyDirectory(Directory source, Directory destination) async {
+    await destination.create(recursive: true);
+    await for (final entity in source.list(followLinks: false)) {
+      final name = entity.uri.pathSegments
+          .where((segment) => segment.isNotEmpty)
+          .last;
+      if (entity is File) {
+        final target = File('${destination.path}/$name');
+        if (!await target.exists()) await entity.copy(target.path);
+      } else if (entity is Directory) {
+        await _copyDirectory(entity, Directory('${destination.path}/$name'));
+      }
+    }
+  }
+
+  Future<void> _discoverSavedPages() async {
+    final path = _localSaveDirectory;
+    if (path == null || path.isEmpty) return;
+    final directory = Directory(path);
+    if (!await directory.exists()) return;
+
+    final discovered = <SavedPageEntry>[];
+    try {
+      await for (final entity in directory.list(followLinks: false)) {
+        if (entity is! File ||
+            !RegExp(
+              r'\.(md|markdown)$',
+              caseSensitive: false,
+            ).hasMatch(entity.path)) {
+          continue;
+        }
+        final markdown = await entity.readAsString();
+        final source = RegExp(
+          r'^source:\s*["\x27]?(.+?)["\x27]?\s*$',
+          multiLine: true,
+        ).firstMatch(markdown)?.group(1);
+        if (source == null || source.trim().isEmpty) continue;
+        final title =
+            RegExp(
+              r'^title:\s*["\x27]?(.+?)["\x27]?\s*$',
+              multiLine: true,
+            ).firstMatch(markdown)?.group(1) ??
+            entity.uri.pathSegments.last;
+        final body = markdown.replaceFirst(
+          RegExp(r'^---\s*\n.*?\n---\s*\n', dotAll: true),
+          '',
+        );
+        final modified = await entity.lastModified();
+        discovered.add(
+          SavedPageEntry(
+            url: source.trim(),
+            title: title.trim(),
+            contentHash: _contentHash(body),
+            localizedContentHash: _contentHash(body),
+            filePath: entity.path,
+            savedAt: modified,
+            allLocal: RegExp(r'!\[[^\]]*\]\([^):]+_assets/').hasMatch(body),
+          ),
+        );
+      }
+    } on FileSystemException catch (_) {
+      if (mounted) {
+        setState(() {
+          _localSaveDirectory = null;
+          _workspace = null;
+          _workspaceRoot = null;
+          _statusMessage =
+              'The saved folder cannot be accessed. Choose the folder again to restore permission.';
+        });
+        await _persistAppState();
+      }
+      return;
+    }
+    if (!mounted || discovered.isEmpty) return;
+    setState(() {
+      for (final entry in discovered) {
+        _savedPages.removeWhere((saved) => saved.url == entry.url);
+        _savedPages.add(entry);
+      }
+      _savedPages.sort((a, b) => b.savedAt.compareTo(a.savedAt));
+    });
   }
 
   void _bookmarkCurrentPage() {
@@ -931,6 +1659,170 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       _statusMessage = 'Bookmarked: ${bookmark.displayTitle}';
     });
     _persistAppState();
+  }
+
+  Future<void> _editBookmark(PageLinkEntry bookmark) async {
+    final controller = TextEditingController(text: bookmark.title);
+    final title = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Edit bookmark'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: 'Title',
+            border: OutlineInputBorder(),
+          ),
+          onSubmitted: (value) => Navigator.of(dialogContext).pop(value),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.of(dialogContext).pop(controller.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (title == null || !mounted) return;
+    setState(() {
+      final index = _bookmarks.indexWhere((item) => item.url == bookmark.url);
+      if (index >= 0) {
+        _bookmarks[index] = PageLinkEntry(url: bookmark.url, title: title);
+      }
+      _statusMessage = 'Bookmark updated.';
+    });
+    await _persistAppState();
+  }
+
+  Future<void> _deleteBookmark(PageLinkEntry bookmark) async {
+    setState(() {
+      _bookmarks.removeWhere((item) => item.url == bookmark.url);
+      _statusMessage = 'Bookmark removed.';
+    });
+    await _persistAppState();
+  }
+
+  Future<void> _deleteHistoryEntry(PageLinkEntry entry) async {
+    setState(() {
+      _history.removeWhere((item) => item.url == entry.url);
+      _statusMessage = 'History entry removed.';
+    });
+    await _persistAppState();
+  }
+
+  Future<bool> _confirmSavedContentDeletion({
+    required String title,
+    required List<String> paths,
+  }) async {
+    if (paths.isEmpty) return true;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(title),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 520),
+          child: SingleChildScrollView(
+            child: Text(
+              'The following saved content still exists. Delete it from disk as well?\n\n${paths.join('\n')}',
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton.icon(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            icon: const Icon(Icons.delete_forever_outlined),
+            label: const Text('Delete content'),
+          ),
+        ],
+      ),
+    );
+    return confirmed == true;
+  }
+
+  Future<void> _deleteSavedPage(SavedPageEntry entry) async {
+    final paths = await SavedPageContentStore.existingPaths(entry);
+    if (!mounted ||
+        !await _confirmSavedContentDeletion(
+          title: 'Delete saved page?',
+          paths: paths,
+        )) {
+      return;
+    }
+    Object? contentDeletionError;
+    try {
+      await SavedPageContentStore.deleteIfPresent(entry);
+    } catch (error) {
+      contentDeletionError = error;
+    }
+    if (!mounted) return;
+    setState(() {
+      _savedPages.removeWhere((page) => page.url == entry.url);
+      for (final tab in _tabs) {
+        if (tab.savedFilePath == entry.filePath) {
+          tab
+            ..savedMarkdown = null
+            ..savedFilePath = null;
+        }
+      }
+      _statusMessage = contentDeletionError != null
+          ? 'Saved-page entry removed, but local content could not be deleted: $contentDeletionError'
+          : paths.isEmpty
+          ? 'Saved-page entry removed. Its content was already missing.'
+          : 'Saved page and local content deleted.';
+    });
+    await _persistAppState();
+  }
+
+  Future<void> _deleteAllSavedPages() async {
+    final entries = List<SavedPageEntry>.of(_savedPages);
+    final paths = <String>{};
+    for (final entry in entries) {
+      paths.addAll(await SavedPageContentStore.existingPaths(entry));
+    }
+    if (!mounted ||
+        !await _confirmSavedContentDeletion(
+          title: 'Delete all saved pages?',
+          paths: paths.toList()..sort(),
+        )) {
+      return;
+    }
+    final contentDeletionErrors = <Object>[];
+    for (final entry in entries) {
+      try {
+        await SavedPageContentStore.deleteIfPresent(entry);
+      } catch (error) {
+        contentDeletionErrors.add(error);
+      }
+    }
+    if (!mounted) return;
+    final savedPaths = entries.map((entry) => entry.filePath).toSet();
+    setState(() {
+      _savedPages.clear();
+      for (final tab in _tabs) {
+        if (savedPaths.contains(tab.savedFilePath)) {
+          tab
+            ..savedMarkdown = null
+            ..savedFilePath = null;
+        }
+      }
+      _statusMessage = contentDeletionErrors.isNotEmpty
+          ? 'Saved-page list cleared, but some local content could not be deleted.'
+          : paths.isEmpty
+          ? 'Saved-page list cleared. Its content was already missing.'
+          : 'Saved pages and local content deleted.';
+    });
+    await _persistAppState();
   }
 
   Future<void> _saveHomePageSetting() async {
@@ -971,7 +1863,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Text(
-                  'History, bookmarks, the home page, the last save folder, and save preferences are stored in the app data folder. Markdown files and images saved to your local folder are not deleted here.',
+                  'Markdown, images, bookmarks, history, and shared settings are stored in the selected workspace. Cloud synchronization can be provided by the folder location.',
                 ),
                 const SizedBox(height: 12),
                 TextField(
@@ -1001,6 +1893,14 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             ),
             TextButton.icon(
               onPressed: () {
+                Navigator.of(dialogContext).pop();
+                _localizeImagesInMarkdownFile();
+              },
+              icon: const Icon(Icons.perm_media_outlined),
+              label: const Text('Localize Markdown images'),
+            ),
+            TextButton.icon(
+              onPressed: () {
                 setState(() {
                   _history.clear();
                   _statusMessage = 'History cleared.';
@@ -1025,26 +1925,26 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             ),
             TextButton.icon(
               onPressed: () {
-                setState(() {
-                  _savedPages.clear();
-                  _statusMessage = 'Session saved-page list cleared.';
-                });
                 Navigator.of(dialogContext).pop();
+                _deleteAllSavedPages();
               },
               icon: const Icon(Icons.playlist_remove),
-              label: const Text('Clear saved list'),
+              label: const Text('Delete saved pages'),
             ),
             TextButton.icon(
               onPressed: () {
                 setState(() {
                   _localSaveDirectory = null;
-                  _statusMessage = 'Local save folder setting cleared.';
+                  _workspace = null;
+                  _workspaceRoot = null;
+                  _statusMessage = 'Workspace setting cleared.';
                 });
+                WorkspaceAccess.forget();
                 _persistAppState();
                 Navigator.of(dialogContext).pop();
               },
               icon: const Icon(Icons.folder_delete_outlined),
-              label: const Text('Forget folder'),
+              label: const Text('Forget workspace'),
             ),
             FilledButton.icon(
               onPressed: () async {
@@ -1204,7 +2104,12 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         return '`${node.text.trim()}`';
       case 'a':
         final href = node.attributes['href'] ?? '';
-        return href.isEmpty ? children : '[$children]($href)';
+        final label = node.text
+            .replaceAll(RegExp(r'\s+'), ' ')
+            .trim()
+            .replaceAll('[', r'\[')
+            .replaceAll(']', r'\]');
+        return href.isEmpty ? label : '[$label]($href)';
       case 'img':
         final src = node.attributes['src'] ?? '';
         final alt = node.attributes['alt'] ?? 'image';
@@ -1309,7 +2214,26 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               saveAllLocally: _saveAllLocally,
               showLibraryRail: _showLibraryRail,
               showInsightPanel: _showInsightPanel,
-              localSaveDirectory: _localSaveDirectory,
+              localSaveDirectory: _workspaceRoot,
+              isCurrentPageSaved:
+                  document != null &&
+                  _savedPages.any(
+                    (page) =>
+                        page.url == document.url &&
+                        (!_saveAllLocally || page.allLocal) &&
+                        (page.contentHash ==
+                                _contentHash(
+                                  _markdownController.text.isEmpty
+                                      ? document.markdown
+                                      : _markdownController.text,
+                                ) ||
+                            page.localizedContentHash ==
+                                _contentHash(
+                                  _markdownController.text.isEmpty
+                                      ? document.markdown
+                                      : _markdownController.text,
+                                )),
+                  ),
               onOpen: _openAddress,
               onHome: () => _openHomePage(),
               onBack: _goBack,
@@ -1337,65 +2261,9 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               },
             ),
             Expanded(
-              child: LayoutBuilder(
-                builder: (context, constraints) {
-                  final compact = constraints.maxWidth < 900;
-                  if (compact) {
-                    return Column(
-                      children: [
-                        _ModeSelector(
-                          activeMode: _activeTab.viewMode,
-                          onSelected: _setViewMode,
-                        ),
-                        Expanded(child: _mainView(document: document)),
-                      ],
-                    );
-                  }
-                  return Row(
-                    children: [
-                      if (_showLibraryRail)
-                        SizedBox(
-                          width: 250,
-                          child: _LibraryRail(
-                            activeSection: _activeLibrarySection,
-                            history: _history,
-                            bookmarks: _bookmarks,
-                            savedPages: _savedPages,
-                            onSectionChanged: (section) {
-                              setState(() {
-                                _activeLibrarySection = section;
-                              });
-                            },
-                            onOpenHistory: (url) {
-                              _addressController.text = url.url;
-                              _openAddress();
-                            },
-                            onOpenBookmark: (bookmark) {
-                              _addressController.text = bookmark.url;
-                              _openAddress();
-                            },
-                          ),
-                        ),
-                      Expanded(
-                        flex: 7,
-                        child: Column(
-                          children: [
-                            _ModeSelector(
-                              activeMode: _activeTab.viewMode,
-                              onSelected: _setViewMode,
-                            ),
-                            Expanded(child: _mainView(document: document)),
-                          ],
-                        ),
-                      ),
-                      if (_showInsightPanel)
-                        SizedBox(
-                          width: 310,
-                          child: _InsightPanel(document: document),
-                        ),
-                    ],
-                  );
-                },
+              child: _buildWorkspaceBody(
+                document: document,
+                width: MediaQuery.sizeOf(context).width,
               ),
             ),
             if (_statusMessage != null)
@@ -1404,6 +2272,77 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         ),
       ),
     );
+  }
+
+  Widget _buildWorkspaceBody({
+    required PageDocument? document,
+    required double width,
+  }) {
+    final content = Column(
+      children: [
+        _ModeSelector(
+          activeMode: _activeTab.viewMode,
+          onSelected: _setViewMode,
+        ),
+        Expanded(child: _mainView(document: document)),
+      ],
+    );
+    if (width < 900) {
+      if (!_showLibraryRail) return content;
+      return Row(
+        children: [
+          SizedBox(width: width < 600 ? 220 : 250, child: _buildLibraryRail()),
+          Expanded(child: content),
+        ],
+      );
+    }
+    return Row(
+      children: [
+        if (_showLibraryRail) SizedBox(width: 250, child: _buildLibraryRail()),
+        Expanded(flex: 7, child: content),
+        if (_showInsightPanel)
+          SizedBox(width: 310, child: _InsightPanel(document: document)),
+      ],
+    );
+  }
+
+  Widget _buildLibraryRail() {
+    return _LibraryRail(
+      activeSection: _activeLibrarySection,
+      history: _history,
+      bookmarks: _bookmarks,
+      savedPages: _savedPages,
+      onSectionChanged: (section) {
+        setState(() {
+          _activeLibrarySection = section;
+        });
+      },
+      onAddBookmark: _bookmarkCurrentPage,
+      onEditBookmark: _editBookmark,
+      onDeleteBookmark: _deleteBookmark,
+      onDeleteHistory: _deleteHistoryEntry,
+      onDeleteSaved: _deleteSavedPage,
+      onOpenHistory: (entry) {
+        _addressController.text = entry.url;
+        _openAddress();
+      },
+      onOpenBookmark: (bookmark) {
+        _addressController.text = bookmark.url;
+        _openAddress();
+      },
+      onOpenSaved: _openSavedPage,
+    );
+  }
+
+  static String _contentHash(String markdown) {
+    final normalized = markdown
+        .replaceAll('\r\n', '\n')
+        .replaceAllMapped(
+          RegExp(r'!\[([^\]]*)\]\(([^)]+)\)'),
+          (match) => '![${match.group(1)}](<image>)',
+        )
+        .trim();
+    return sha256.convert(utf8.encode(normalized)).toString();
   }
 
   Widget _mainView({required PageDocument? document}) {
@@ -1424,10 +2363,34 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       case ViewMode.reader:
         return _ReaderView(document: document);
       case ViewMode.markdown:
-        return Markdown(
-          data: document.markdown,
-          selectable: true,
-          padding: const EdgeInsets.all(28),
+        final savedFilePath = _activeTab.savedFilePath;
+        final imageDirectory = savedFilePath == null
+            ? null
+            : File(savedFilePath).parent.uri.toString();
+        return Column(
+          children: [
+            Container(
+              width: double.infinity,
+              color: const Color(0xffe9f3ee),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+              child: Text(
+                savedFilePath == null
+                    ? 'Markdown converted from the current Web page'
+                    : 'Saved Markdown: $savedFilePath',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.labelMedium,
+              ),
+            ),
+            Expanded(
+              child: Markdown(
+                data: _activeTab.displayedMarkdown,
+                imageDirectory: imageDirectory,
+                selectable: true,
+                padding: const EdgeInsets.all(28),
+              ),
+            ),
+          ],
         );
       case ViewMode.editor:
         return Padding(
@@ -1457,7 +2420,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
 }
 
 class LocalMarkdownSaver {
-  static Future<String> save({
+  static Future<LocalMarkdownSaveResult> save({
     required String directoryPath,
     required PageDocument document,
     required String markdown,
@@ -1484,7 +2447,58 @@ class LocalMarkdownSaver {
     await output.writeAsString(
       _markdownWithFrontMatter(document, rewrittenMarkdown),
     );
-    return output.path;
+    return LocalMarkdownSaveResult(
+      filePath: output.path,
+      markdown: rewrittenMarkdown,
+      localizedCount: saveAllLocally
+          ? _countLocalizedImageLinks(rewrittenMarkdown, assetDirectoryName)
+          : 0,
+    );
+  }
+
+  static Future<MarkdownImageLocalizationResult> localizeMarkdownFileImages({
+    required String filePath,
+  }) async {
+    final file = File(filePath);
+    if (!await file.exists()) {
+      throw FileSystemException('Markdown file does not exist.', filePath);
+    }
+
+    final markdown = await file.readAsString();
+    final fileName = file.uri.pathSegments.isEmpty
+        ? 'markdown'
+        : file.uri.pathSegments.last;
+    final baseName = fileName.replaceFirst(RegExp(r'\.(md|markdown)$'), '');
+    final assetDirectoryName = '${_safeAssetDirectoryName(baseName)}_assets';
+    final assetDirectory = Directory('${file.parent.path}/$assetDirectoryName');
+    final result = await _localizeImagesWithResult(
+      markdown: markdown,
+      documentUrl: file.uri.toString(),
+      assetDirectory: assetDirectory,
+      assetDirectoryName: assetDirectoryName,
+      copyLocalFiles: true,
+    );
+
+    if (result.localizedCount > 0 && result.markdown != markdown) {
+      await file.writeAsString(result.markdown);
+    }
+
+    return MarkdownImageLocalizationResult(
+      filePath: file.path,
+      fileName: fileName,
+      markdown: result.markdown,
+      imageLinkCount: result.imageLinkCount,
+      localizedCount: result.localizedCount,
+    );
+  }
+
+  static int _countLocalizedImageLinks(
+    String markdown,
+    String assetDirectoryName,
+  ) {
+    return RegExp(
+      r'!\[[^\]]*\]\(' + RegExp.escape('$assetDirectoryName/') + r'[^)]+\)',
+    ).allMatches(markdown).length;
   }
 
   static Future<String> _localizeImages({
@@ -1492,48 +2506,70 @@ class LocalMarkdownSaver {
     required String documentUrl,
     required Directory assetDirectory,
     required String assetDirectoryName,
+    bool copyLocalFiles = false,
+  }) async {
+    final result = await _localizeImagesWithResult(
+      markdown: markdown,
+      documentUrl: documentUrl,
+      assetDirectory: assetDirectory,
+      assetDirectoryName: assetDirectoryName,
+      copyLocalFiles: copyLocalFiles,
+    );
+    return result.markdown;
+  }
+
+  static Future<_LocalizedMarkdown> _localizeImagesWithResult({
+    required String markdown,
+    required String documentUrl,
+    required Directory assetDirectory,
+    required String assetDirectoryName,
+    required bool copyLocalFiles,
   }) async {
     final imagePattern = RegExp(r'!\[([^\]]*)\]\(([^)]+)\)');
-    var rewritten = markdown;
     final matches = imagePattern.allMatches(markdown).toList();
+    final rewritten = StringBuffer();
+    var previousEnd = 0;
     var index = 1;
+    var localizedCount = 0;
 
     for (final match in matches) {
       final original = match.group(0)!;
+      var replacement = original;
       final alt = match.group(1) ?? 'image';
-      final src = match.group(2) ?? '';
+      final src = _cleanMarkdownImageDestination(match.group(2) ?? '');
       final uri = _resolveImageUri(documentUrl, src);
-      if (uri == null || !_isDownloadableImageUri(uri)) {
-        continue;
-      }
-
-      try {
-        final response = await http.get(uri);
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          continue;
+      if (uri != null) {
+        try {
+          final bytes = await _imageBytes(uri, copyLocalFiles: copyLocalFiles);
+          if (bytes != null) {
+            if (!await assetDirectory.exists()) {
+              await assetDirectory.create(recursive: true);
+            }
+            final extension = _imageExtension(uri, bytes.contentType);
+            final assetName =
+                'image_${index.toString().padLeft(3, '0')}.$extension';
+            final assetFile = File('${assetDirectory.path}/$assetName');
+            await assetFile.writeAsBytes(bytes.data);
+            replacement = '![${alt.trim()}]($assetDirectoryName/$assetName)';
+            index += 1;
+            localizedCount += 1;
+          }
+        } catch (_) {
+          replacement = original;
         }
-        if (!await assetDirectory.exists()) {
-          await assetDirectory.create(recursive: true);
-        }
-        final extension = _imageExtension(
-          uri,
-          response.headers['content-type'],
-        );
-        final assetName =
-            'image_${index.toString().padLeft(3, '0')}.$extension';
-        final assetFile = File('${assetDirectory.path}/$assetName');
-        await assetFile.writeAsBytes(response.bodyBytes);
-        rewritten = rewritten.replaceAll(
-          original,
-          '![${alt.trim()}]($assetDirectoryName/$assetName)',
-        );
-        index += 1;
-      } catch (_) {
-        continue;
       }
+      rewritten
+        ..write(markdown.substring(previousEnd, match.start))
+        ..write(replacement);
+      previousEnd = match.end;
     }
+    rewritten.write(markdown.substring(previousEnd));
 
-    return rewritten;
+    return _LocalizedMarkdown(
+      markdown: rewritten.toString(),
+      imageLinkCount: matches.length,
+      localizedCount: localizedCount,
+    );
   }
 
   static Uri? _resolveImageUri(String documentUrl, String src) {
@@ -1551,8 +2587,36 @@ class LocalMarkdownSaver {
     return base.resolveUri(parsed);
   }
 
-  static bool _isDownloadableImageUri(Uri uri) {
-    return uri.scheme == 'https' || uri.scheme == 'http';
+  static Future<_ImageBytes?> _imageBytes(
+    Uri uri, {
+    required bool copyLocalFiles,
+  }) async {
+    if (uri.scheme == 'https' || uri.scheme == 'http') {
+      final response = await http.get(uri);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        return null;
+      }
+      return _ImageBytes(
+        data: response.bodyBytes,
+        contentType: response.headers['content-type'],
+      );
+    }
+    if (!copyLocalFiles || (uri.scheme.isNotEmpty && uri.scheme != 'file')) {
+      return null;
+    }
+    final file = uri.scheme == 'file' ? File.fromUri(uri) : File(uri.path);
+    if (!await file.exists()) {
+      return null;
+    }
+    return _ImageBytes(data: await file.readAsBytes());
+  }
+
+  static String _cleanMarkdownImageDestination(String raw) {
+    var src = raw.trim();
+    if (src.startsWith('<') && src.endsWith('>')) {
+      src = src.substring(1, src.length - 1).trim();
+    }
+    return src;
   }
 
   static String _imageExtension(Uri uri, String? contentType) {
@@ -1574,6 +2638,14 @@ class LocalMarkdownSaver {
     if (contentType?.contains('webp') == true) return 'webp';
     if (contentType?.contains('svg') == true) return 'svg';
     return 'jpg';
+  }
+
+  static String _safeAssetDirectoryName(String value) {
+    final safeName = value
+        .replaceAll(RegExp(r'[\\/:*?"<>|]+'), '-')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    return safeName.isEmpty ? 'markdown' : safeName;
   }
 
   static String _fileName(PageDocument document) {
@@ -1611,6 +2683,53 @@ created: "${DateTime.now().toUtc().toIso8601String()}"
 $markdown
 ''';
   }
+}
+
+class MarkdownImageLocalizationResult {
+  const MarkdownImageLocalizationResult({
+    required this.filePath,
+    required this.fileName,
+    required this.markdown,
+    required this.imageLinkCount,
+    required this.localizedCount,
+  });
+
+  final String filePath;
+  final String fileName;
+  final String markdown;
+  final int imageLinkCount;
+  final int localizedCount;
+}
+
+class LocalMarkdownSaveResult {
+  const LocalMarkdownSaveResult({
+    required this.filePath,
+    required this.markdown,
+    required this.localizedCount,
+  });
+
+  final String filePath;
+  final String markdown;
+  final int localizedCount;
+}
+
+class _LocalizedMarkdown {
+  const _LocalizedMarkdown({
+    required this.markdown,
+    required this.imageLinkCount,
+    required this.localizedCount,
+  });
+
+  final String markdown;
+  final int imageLinkCount;
+  final int localizedCount;
+}
+
+class _ImageBytes {
+  const _ImageBytes({required this.data, this.contentType});
+
+  final List<int> data;
+  final String? contentType;
 }
 
 class _TabStrip extends StatelessWidget {
@@ -1712,6 +2831,7 @@ class _Toolbar extends StatelessWidget {
     required this.showLibraryRail,
     required this.showInsightPanel,
     required this.localSaveDirectory,
+    required this.isCurrentPageSaved,
     required this.onOpen,
     required this.onHome,
     required this.onBack,
@@ -1736,6 +2856,7 @@ class _Toolbar extends StatelessWidget {
   final bool showLibraryRail;
   final bool showInsightPanel;
   final String? localSaveDirectory;
+  final bool isCurrentPageSaved;
   final VoidCallback onOpen;
   final VoidCallback onHome;
   final VoidCallback onBack;
@@ -1751,6 +2872,7 @@ class _Toolbar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final compact = MediaQuery.sizeOf(context).width < 900;
     return Material(
       elevation: 1,
       color: Colors.white,
@@ -1809,22 +2931,27 @@ class _Toolbar extends StatelessWidget {
             const SizedBox(width: 8),
             Tooltip(
               message: localSaveDirectory == null
-                  ? 'Choose save folder'
-                  : 'Save folder: $localSaveDirectory',
+                  ? 'Choose workspace'
+                  : 'Workspace: $localSaveDirectory',
               child: IconButton(
                 onPressed: onChooseFolder,
                 icon: const Icon(Icons.folder_open),
               ),
             ),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Checkbox(
-                  value: saveAllLocally,
-                  onChanged: (value) => onToggleSaveAllLocally(value ?? false),
-                ),
-                const Text('All local'),
-              ],
+            Tooltip(
+              message:
+                  'Save available images beside the Markdown file and use relative links',
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Checkbox(
+                    value: saveAllLocally,
+                    onChanged: (value) =>
+                        onToggleSaveAllLocally(value ?? false),
+                  ),
+                  if (!compact) const Text('Local images'),
+                ],
+              ),
             ),
             Tooltip(
               message: showLibraryRail ? 'Hide bookmarks' : 'Show bookmarks',
@@ -1860,7 +2987,10 @@ class _Toolbar extends StatelessWidget {
             ),
             const SizedBox(width: 8),
             FilledButton.icon(
-              onPressed: activeTab.document == null || isSavingLocal
+              onPressed:
+                  activeTab.document == null ||
+                      isSavingLocal ||
+                      isCurrentPageSaved
                   ? null
                   : onSave,
               icon: isSavingLocal
@@ -1869,8 +2999,10 @@ class _Toolbar extends StatelessWidget {
                       height: 16,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
-                  : const Icon(Icons.save_alt),
-              label: const Text('Save'),
+                  : Icon(
+                      isCurrentPageSaved ? Icons.check_circle : Icons.save_alt,
+                    ),
+              label: Text(isCurrentPageSaved ? 'Saved' : 'Save'),
             ),
           ],
         ),
@@ -1906,32 +3038,72 @@ class _ModeSelector extends StatelessWidget {
   }
 }
 
-class _LibraryRail extends StatelessWidget {
+class _LibraryRail extends StatefulWidget {
   const _LibraryRail({
     required this.activeSection,
     required this.history,
     required this.bookmarks,
     required this.savedPages,
     required this.onSectionChanged,
+    required this.onAddBookmark,
+    required this.onEditBookmark,
+    required this.onDeleteBookmark,
+    required this.onDeleteHistory,
+    required this.onDeleteSaved,
     required this.onOpenHistory,
     required this.onOpenBookmark,
+    required this.onOpenSaved,
   });
 
   final LibrarySection activeSection;
   final List<PageLinkEntry> history;
   final List<PageLinkEntry> bookmarks;
-  final List<PageDocument> savedPages;
+  final List<SavedPageEntry> savedPages;
   final ValueChanged<LibrarySection> onSectionChanged;
+  final VoidCallback onAddBookmark;
+  final ValueChanged<PageLinkEntry> onEditBookmark;
+  final ValueChanged<PageLinkEntry> onDeleteBookmark;
+  final ValueChanged<PageLinkEntry> onDeleteHistory;
+  final ValueChanged<SavedPageEntry> onDeleteSaved;
   final ValueChanged<PageLinkEntry> onOpenHistory;
   final ValueChanged<PageLinkEntry> onOpenBookmark;
+  final ValueChanged<SavedPageEntry> onOpenSaved;
+
+  @override
+  State<_LibraryRail> createState() => _LibraryRailState();
+}
+
+class _LibraryRailState extends State<_LibraryRail> {
+  late LibrarySection _selectedSection;
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedSection = widget.activeSection;
+  }
+
+  @override
+  void didUpdateWidget(covariant _LibraryRail oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.activeSection != oldWidget.activeSection &&
+        widget.activeSection != _selectedSection) {
+      _selectedSection = widget.activeSection;
+    }
+  }
+
+  void _selectSection(LibrarySection section) {
+    if (_selectedSection == section) return;
+    setState(() {
+      _selectedSection = section;
+    });
+    widget.onSectionChanged(section);
+  }
 
   @override
   Widget build(BuildContext context) {
-    return DecoratedBox(
-      decoration: const BoxDecoration(
-        color: Color(0xffedf2f1),
-        border: Border(right: BorderSide(color: Color(0xffd8e0df))),
-      ),
+    return Material(
+      color: const Color(0xffedf2f1),
+      shape: const Border(right: BorderSide(color: Color(0xffd8e0df))),
       child: ListView(
         padding: const EdgeInsets.all(12),
         children: [
@@ -1940,19 +3112,32 @@ class _LibraryRail extends StatelessWidget {
             segments: LibrarySection.values.map((section) {
               return ButtonSegment<LibrarySection>(
                 value: section,
-                icon: SizedBox(width: 44, child: Icon(section.icon, size: 18)),
+                tooltip: section.label,
+                icon: Icon(section.icon, size: 18),
               );
             }).toList(),
-            selected: {activeSection},
-            onSelectionChanged: (selection) =>
-                onSectionChanged(selection.first),
+            selected: {_selectedSection},
+            onSelectionChanged: (selection) => _selectSection(selection.first),
           ),
           const SizedBox(height: 10),
-          Text(
-            activeSection.label,
-            style: Theme.of(context).textTheme.titleSmall,
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  _selectedSection.label,
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+              ),
+              if (_selectedSection == LibrarySection.bookmarks)
+                IconButton(
+                  tooltip: 'Bookmark current page',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: widget.onAddBookmark,
+                  icon: const Icon(Icons.add, size: 18),
+                ),
+            ],
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 4),
           ..._sectionItems(),
         ],
       ),
@@ -1960,55 +3145,66 @@ class _LibraryRail extends StatelessWidget {
   }
 
   List<Widget> _sectionItems() {
-    switch (activeSection) {
+    switch (_selectedSection) {
       case LibrarySection.bookmarks:
-        if (bookmarks.isEmpty) {
+        if (widget.bookmarks.isEmpty) {
           return const <Widget>[Text('Use the bookmark button to keep pages.')];
         }
-        return bookmarks
+        return widget.bookmarks
             .map(
               (bookmark) => _PageLinkTile(
                 entry: bookmark,
                 icon: Icons.bookmark_border,
-                onTap: () => onOpenBookmark(bookmark),
+                onTap: () => widget.onOpenBookmark(bookmark),
+                onEdit: () => widget.onEditBookmark(bookmark),
+                onDelete: () => widget.onDeleteBookmark(bookmark),
               ),
             )
             .toList();
       case LibrarySection.history:
-        if (history.isEmpty) {
+        if (widget.history.isEmpty) {
           return const <Widget>[Text('Open a URL to start history.')];
         }
-        return history
+        return widget.history
             .map(
               (entry) => _PageLinkTile(
                 entry: entry,
                 icon: Icons.history,
-                onTap: () => onOpenHistory(entry),
+                onTap: () => widget.onOpenHistory(entry),
+                onDelete: () => widget.onDeleteHistory(entry),
               ),
             )
             .toList();
       case LibrarySection.saved:
-        if (savedPages.isEmpty) {
-          return const <Widget>[
-            Text('Saved pages remain available during this session.'),
-          ];
+        if (widget.savedPages.isEmpty) {
+          return const <Widget>[Text('Saved pages will appear here.')];
         }
-        return savedPages
+        return widget.savedPages
             .map(
               (page) => ListTile(
                 dense: true,
                 contentPadding: EdgeInsets.zero,
                 leading: const Icon(Icons.description_outlined, size: 18),
                 title: Text(
-                  page.metadata.title,
+                  page.title,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
                 subtitle: Text(
-                  page.url,
+                  page.filePath,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
+                trailing: PopupMenuButton<String>(
+                  tooltip: 'Saved page actions',
+                  onSelected: (value) {
+                    if (value == 'delete') widget.onDeleteSaved(page);
+                  },
+                  itemBuilder: (context) => const [
+                    PopupMenuItem(value: 'delete', child: Text('Delete')),
+                  ],
+                ),
+                onTap: () => widget.onOpenSaved(page),
               ),
             )
             .toList();
@@ -2021,11 +3217,15 @@ class _PageLinkTile extends StatelessWidget {
     required this.entry,
     required this.icon,
     required this.onTap,
+    this.onEdit,
+    this.onDelete,
   });
 
   final PageLinkEntry entry;
   final IconData icon;
   final VoidCallback onTap;
+  final VoidCallback? onEdit;
+  final VoidCallback? onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -2042,6 +3242,21 @@ class _PageLinkTile extends StatelessWidget {
       subtitle: hasTitle
           ? Text(entry.url, maxLines: 1, overflow: TextOverflow.ellipsis)
           : null,
+      trailing: onEdit == null && onDelete == null
+          ? null
+          : PopupMenuButton<String>(
+              tooltip: onEdit == null ? 'History actions' : 'Bookmark actions',
+              onSelected: (value) {
+                if (value == 'edit') onEdit?.call();
+                if (value == 'delete') onDelete?.call();
+              },
+              itemBuilder: (context) => [
+                if (onEdit != null)
+                  const PopupMenuItem(value: 'edit', child: Text('Edit title')),
+                if (onDelete != null)
+                  const PopupMenuItem(value: 'delete', child: Text('Delete')),
+              ],
+            ),
       onTap: onTap,
     );
   }
@@ -2054,11 +3269,9 @@ class _InsightPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return DecoratedBox(
-      decoration: const BoxDecoration(
-        color: Color(0xfff8fbfa),
-        border: Border(left: BorderSide(color: Color(0xffd8e0df))),
-      ),
+    return Material(
+      color: const Color(0xfff8fbfa),
+      shape: const Border(left: BorderSide(color: Color(0xffd8e0df))),
       child: document == null
           ? const Center(child: Text('No page loaded.'))
           : ListView(
