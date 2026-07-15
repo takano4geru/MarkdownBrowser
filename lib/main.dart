@@ -11,6 +11,7 @@ import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html_parser;
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
+import 'package:webview_all_linux/webview_all_linux.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_windows/webview_flutter_windows.dart'
     as windows_webview;
@@ -19,11 +20,15 @@ import 'package:webview_flutter_wkwebview/webview_flutter_wkwebview.dart';
 const String defaultHomePageUrl = 'https://www.google.com';
 
 void main() {
+  if (Platform.isLinux) {
+    LinuxWebViewPlatform.registerWith();
+  }
   runApp(
     MarkdownBrowserApp(
       enableNativeWebView:
           Platform.isAndroid ||
           Platform.isIOS ||
+          Platform.isLinux ||
           Platform.isMacOS ||
           Platform.isWindows,
     ),
