@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -11,12 +12,22 @@ import 'package:html/parser.dart' as html_parser;
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+import 'package:webview_flutter_windows/webview_flutter_windows.dart'
+    as windows_webview;
 import 'package:webview_flutter_wkwebview/webview_flutter_wkwebview.dart';
 
 const String defaultHomePageUrl = 'https://www.google.com';
 
 void main() {
-  runApp(const MarkdownBrowserApp());
+  runApp(
+    MarkdownBrowserApp(
+      enableNativeWebView:
+          Platform.isAndroid ||
+          Platform.isIOS ||
+          Platform.isMacOS ||
+          Platform.isWindows,
+    ),
+  );
 }
 
 class MarkdownBrowserApp extends StatelessWidget {
@@ -617,6 +628,9 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   final List<PageLinkEntry> _history = <PageLinkEntry>[];
   final List<PageLinkEntry> _bookmarks = <PageLinkEntry>[];
   WebViewController? _webViewController;
+  windows_webview.WebviewController? _windowsWebViewController;
+  Future<void>? _windowsWebViewInitialization;
+  final List<StreamSubscription<dynamic>> _windowsWebViewSubscriptions = [];
   WorkspaceStore? _workspace;
   String? _workspaceRoot;
   String? _localSaveDirectory;
@@ -634,6 +648,10 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
 
   BrowserTab get _activeTab => _tabs[_activeIndex];
 
+  bool get _hasWebViewController => Platform.isWindows
+      ? _windowsWebViewController?.value.isInitialized == true
+      : _webViewController != null;
+
   @override
   void initState() {
     super.initState();
@@ -646,6 +664,13 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
 
   @override
   void dispose() {
+    for (final subscription in _windowsWebViewSubscriptions) {
+      unawaited(subscription.cancel());
+    }
+    final windowsController = _windowsWebViewController;
+    if (windowsController != null) {
+      unawaited(windowsController.dispose());
+    }
     _addressController.dispose();
     _htmlController.dispose();
     _homePageController.dispose();
@@ -774,6 +799,16 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   }
 
   void _initializeWebView() {
+    if (Platform.isWindows) {
+      unawaited(_initializeWindowsWebView().catchError((_) {}));
+      return;
+    }
+    if (WebViewPlatform.instance == null) {
+      _webViewController = null;
+      _statusMessage = 'Native WebView is not available on this platform.';
+      return;
+    }
+
     late final PlatformWebViewControllerCreationParams params;
     if (WebViewPlatform.instance is WebKitWebViewPlatform) {
       params = WebKitWebViewControllerCreationParams(
@@ -827,11 +862,141 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       );
   }
 
+  Future<void> _initializeWindowsWebView() {
+    final inProgress = _windowsWebViewInitialization;
+    if (inProgress != null) {
+      return inProgress;
+    }
+    final initialization = _createWindowsWebView();
+    _windowsWebViewInitialization = initialization;
+    return initialization;
+  }
+
+  Future<void> _createWindowsWebView() async {
+    try {
+      final version =
+          await windows_webview.WebviewController.getWebViewVersion();
+      if (version == null) {
+        throw StateError('Microsoft Edge WebView2 Runtime is not installed.');
+      }
+
+      final controller = windows_webview.WebviewController();
+      _windowsWebViewController = controller;
+      _windowsWebViewSubscriptions
+        ..add(
+          controller.url.listen((url) {
+            if (!mounted) return;
+            setState(() {
+              _activeTab.currentUrl = url;
+              _addressController.text = url;
+            });
+          }),
+        )
+        ..add(
+          controller.loadingState.listen((state) {
+            if (!mounted) return;
+            if (state == windows_webview.LoadingState.loading) {
+              setState(() {
+                _isLoading = true;
+                _statusMessage = 'Loading ${_activeTab.currentUrl}';
+              });
+            } else if (state ==
+                windows_webview.LoadingState.navigationCompleted) {
+              unawaited(_extractCurrentWebPage(_activeTab.currentUrl));
+            }
+          }),
+        )
+        ..add(
+          controller.historyChanged.listen((history) {
+            if (!mounted) return;
+            setState(() {
+              _canGoBack = history.canGoBack;
+              _canGoForward = history.canGoForward;
+            });
+          }),
+        )
+        ..add(
+          controller.onLoadError.listen((error) {
+            if (!mounted) return;
+            setState(() {
+              _isLoading = false;
+              _statusMessage = 'WebView error: $error';
+            });
+          }),
+        )
+        ..add(controller.webMessage.listen(_handleWindowsWebMessage));
+
+      await controller.initialize();
+      await controller.setPopupWindowPolicy(
+        windows_webview.WebviewPopupWindowPolicy.sameWindow,
+      );
+      _windowsWebViewController = controller;
+      if (mounted) {
+        setState(() {
+          _statusMessage = 'WebView2 ready ($version)';
+        });
+      }
+    } catch (error) {
+      _windowsWebViewController = null;
+      _windowsWebViewInitialization = null;
+      if (!mounted) return;
+      setState(() {
+        _isLoading = false;
+        _statusMessage = 'Could not initialize WebView2: $error';
+      });
+      rethrow;
+    }
+  }
+
+  Future<void> _loadWebRequest(Uri uri) async {
+    if (Platform.isWindows) {
+      await _initializeWindowsWebView();
+      await _windowsWebViewController!.loadUrl(uri.toString());
+      return;
+    }
+    final controller = _webViewController;
+    if (controller == null) {
+      throw StateError('Native WebView is disabled in this environment.');
+    }
+    await controller.loadRequest(uri);
+  }
+
+  Future<dynamic> _executeWebScript(String script) async {
+    if (Platform.isWindows) {
+      await _initializeWindowsWebView();
+      return _windowsWebViewController!.executeScript(script);
+    }
+    final controller = _webViewController;
+    if (controller == null) {
+      throw StateError('Native WebView is disabled in this environment.');
+    }
+    return controller.runJavaScriptReturningResult(script);
+  }
+
+  Future<void> _runWebScript(String script) async {
+    if (Platform.isWindows) {
+      await _initializeWindowsWebView();
+      await _windowsWebViewController!.executeScript(script);
+      return;
+    }
+    final controller = _webViewController;
+    if (controller == null) return;
+    await controller.runJavaScript(script);
+  }
+
   Future<void> _handleContextMenuMessage(JavaScriptMessage message) async {
+    await _handleContextMenuPayload(message.message);
+  }
+
+  void _handleWindowsWebMessage(dynamic message) {
+    unawaited(_handleContextMenuPayload(message));
+  }
+
+  Future<void> _handleContextMenuPayload(dynamic message) async {
     if (!mounted) {
       return;
     }
-    final decoded = jsonDecode(message.message);
+    final decoded = message is String ? jsonDecode(message) : message;
     if (decoded is! Map) {
       return;
     }
@@ -864,8 +1029,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     }
   }
 
-  Future<void> _installContextMenuHandler(WebViewController controller) async {
-    await controller.runJavaScript(r'''
+  Future<void> _installContextMenuHandler() async {
+    await _runWebScript(r'''
       (function () {
         if (window.__markdownBrowserContextMenuInstalled) {
           return;
@@ -878,12 +1043,17 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             return;
           }
           event.preventDefault();
-          MarkdownBrowserContextMenu.postMessage(JSON.stringify({
+          var payload = {
             url: anchor.href,
             title: (anchor.innerText || anchor.title || anchor.href || '').trim(),
             x: event.clientX,
             y: event.clientY
-          }));
+          };
+          if (window.chrome && window.chrome.webview) {
+            window.chrome.webview.postMessage(payload);
+          } else {
+            MarkdownBrowserContextMenu.postMessage(JSON.stringify(payload));
+          }
         }, true);
       })();
     ''');
@@ -902,17 +1072,13 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     });
 
     try {
-      final controller = _webViewController;
-      if (controller == null) {
-        throw StateError('Native WebView is disabled in this environment.');
-      }
       setState(() {
         _activeTab
           ..currentUrl = url
           ..viewMode = ViewMode.web;
         _addressController.text = url;
       });
-      await controller.loadRequest(Uri.parse(url));
+      await _loadWebRequest(Uri.parse(url));
     } catch (error) {
       setState(() {
         _statusMessage =
@@ -934,18 +1100,14 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         ..viewMode = ViewMode.web;
       _addressController.text = url;
       _markdownController.clear();
-      _isLoading = loadWebView && _webViewController != null;
+      _isLoading = loadWebView && widget.enableNativeWebView;
       _statusMessage = 'Home: $url';
     });
     if (!loadWebView) {
       return;
     }
-    final controller = _webViewController;
-    if (controller == null) {
-      return;
-    }
     try {
-      await controller.loadRequest(Uri.parse(url));
+      await _loadWebRequest(Uri.parse(url));
     } catch (error) {
       if (!mounted) {
         return;
@@ -981,15 +1143,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       _markdownController.clear();
       _canGoBack = false;
       _canGoForward = false;
-      _isLoading = widget.enableNativeWebView && _webViewController != null;
+      _isLoading = widget.enableNativeWebView;
       _statusMessage = 'Opening in new tab: $normalizedUrl';
     });
-    final controller = _webViewController;
-    if (controller == null) {
-      return;
-    }
     try {
-      await controller.loadRequest(Uri.parse(normalizedUrl));
+      await _loadWebRequest(Uri.parse(normalizedUrl));
     } catch (error) {
       if (!mounted) {
         return;
@@ -1002,12 +1160,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   }
 
   Future<void> _extractCurrentWebPage(String url) async {
-    final controller = _webViewController;
-    if (controller == null) {
+    if (!_hasWebViewController || url.isEmpty) {
       return;
     }
     try {
-      final result = await controller.runJavaScriptReturningResult(
+      final result = await _executeWebScript(
         'document.documentElement.outerHTML',
       );
       final rawHtml = _javascriptStringResult(result);
@@ -1017,7 +1174,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         return;
       }
       try {
-        await _installContextMenuHandler(controller);
+        await _installContextMenuHandler();
       } catch (_) {
         // Some pages restrict script injection. Markdown extraction still works.
       }
@@ -1165,6 +1322,16 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   }
 
   Future<void> _goBack() async {
+    if (Platform.isWindows) {
+      final controller = _windowsWebViewController;
+      if (controller == null || !_canGoBack) return;
+      setState(() {
+        _isLoading = true;
+        _statusMessage = 'Going back...';
+      });
+      await controller.goBack();
+      return;
+    }
     final controller = _webViewController;
     if (controller == null || !await controller.canGoBack()) {
       await _refreshNavigationState();
@@ -1179,6 +1346,16 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   }
 
   Future<void> _goForward() async {
+    if (Platform.isWindows) {
+      final controller = _windowsWebViewController;
+      if (controller == null || !_canGoForward) return;
+      setState(() {
+        _isLoading = true;
+        _statusMessage = 'Going forward...';
+      });
+      await controller.goForward();
+      return;
+    }
     final controller = _webViewController;
     if (controller == null || !await controller.canGoForward()) {
       await _refreshNavigationState();
@@ -1193,6 +1370,9 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   }
 
   Future<void> _refreshNavigationState() async {
+    if (Platform.isWindows) {
+      return;
+    }
     final controller = _webViewController;
     if (controller == null) {
       if (!mounted) {
@@ -1281,15 +1461,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     if (widget.enableNativeWebView) {
       _initializeWebView();
     }
-    final freshController = _webViewController;
-    if (freshController == null) {
-      return;
-    }
     setState(() {
       _isLoading = true;
     });
     try {
-      await freshController.loadRequest(Uri.parse(url));
+      await _loadWebRequest(Uri.parse(url));
     } catch (error) {
       if (!mounted) {
         return;
@@ -1842,6 +2018,18 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   }
 
   Future<void> _clearWebViewData() async {
+    if (!widget.enableNativeWebView) {
+      return;
+    }
+    if (Platform.isWindows) {
+      final controller = _windowsWebViewController;
+      if (controller == null) return;
+      await controller.clearCache();
+      await controller.clearCookies();
+      await controller.executeScript('localStorage.clear();');
+      return;
+    }
+    if (WebViewPlatform.instance == null) return;
     final controller = _webViewController;
     if (controller != null) {
       await controller.clearCache();
@@ -2346,6 +2534,15 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   }
 
   Widget _mainView({required PageDocument? document}) {
+    if (_activeTab.viewMode == ViewMode.web) {
+      return _NativeWebView(
+        document: document,
+        controller: _webViewController,
+        windowsController: _windowsWebViewController,
+        htmlController: _htmlController,
+        onConvert: _convertPastedHtml,
+      );
+    }
     if (document == null) {
       return _HtmlPastePanel(
         controller: _htmlController,
@@ -2354,12 +2551,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     }
     switch (_activeTab.viewMode) {
       case ViewMode.web:
-        return _NativeWebView(
-          document: document,
-          controller: _webViewController,
-          htmlController: _htmlController,
-          onConvert: _convertPastedHtml,
-        );
+        throw StateError('Web mode is handled before document rendering.');
       case ViewMode.reader:
         return _ReaderView(document: document);
       case ViewMode.markdown:
@@ -3359,18 +3551,27 @@ class _NativeWebView extends StatelessWidget {
   const _NativeWebView({
     required this.document,
     required this.controller,
+    required this.windowsController,
     required this.htmlController,
     required this.onConvert,
   });
 
-  final PageDocument document;
+  final PageDocument? document;
   final WebViewController? controller;
+  final windows_webview.WebviewController? windowsController;
   final TextEditingController htmlController;
   final VoidCallback onConvert;
 
   @override
   Widget build(BuildContext context) {
+    final windowsController = this.windowsController;
+    if (windowsController?.value.isInitialized == true) {
+      return windows_webview.Webview(windowsController!);
+    }
     if (controller == null) {
+      if (Platform.isWindows && windowsController != null) {
+        return const Center(child: CircularProgressIndicator());
+      }
       return ListView(
         padding: const EdgeInsets.all(24),
         children: [
@@ -3384,8 +3585,10 @@ class _NativeWebView extends StatelessWidget {
             style: Theme.of(context).textTheme.bodyMedium,
           ),
           const SizedBox(height: 16),
-          _ReaderCard(document: document),
-          const SizedBox(height: 24),
+          if (document != null) ...[
+            _ReaderCard(document: document!),
+            const SizedBox(height: 24),
+          ],
           _HtmlPastePanel(controller: htmlController, onConvert: onConvert),
         ],
       );
