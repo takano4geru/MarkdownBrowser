@@ -16,6 +16,28 @@ void main() {
     expect(find.byIcon(Icons.arrow_back), findsOneWidget);
     expect(find.byIcon(Icons.arrow_forward), findsOneWidget);
     expect(find.byIcon(Icons.home_outlined), findsOneWidget);
+    expect(find.byTooltip('Open local Markdown file'), findsOneWidget);
+  });
+
+  test('loads a local Markdown file with local resource metadata', () async {
+    final directory = await Directory.systemTemp.createTemp(
+      'markdown-browser-open-test-',
+    );
+    addTearDown(() => directory.delete(recursive: true));
+    final markdownFile = File('${directory.path}/local notes.md');
+    await markdownFile.writeAsString(
+      '# Local notes\n\n[reference](guide.md)\n\n![diagram](images/map.png)',
+    );
+
+    final document = await LocalMarkdownLoader.load(markdownFile.path);
+
+    expect(document.url, Uri.file(markdownFile.absolute.path).toString());
+    expect(document.metadata.title, 'local notes.md');
+    expect(document.metadata.siteName, 'Local Markdown');
+    expect(document.markdown, contains('# Local notes'));
+    expect(document.outline, <String>['Local notes']);
+    expect(document.links, <String>['guide.md']);
+    expect(document.images, <String>['images/map.png']);
   });
 
   testWidgets('library sections remain selectable in compact layout', (

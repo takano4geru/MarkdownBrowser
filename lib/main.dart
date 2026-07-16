@@ -1632,6 +1632,53 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     }
   }
 
+  Future<void> _openLocalMarkdownFile() async {
+    final markdownFile = await openFile(
+      acceptedTypeGroups: const [
+        XTypeGroup(
+          label: 'Markdown and text',
+          extensions: <String>['md', 'markdown', 'mdown', 'mkd', 'txt'],
+        ),
+      ],
+      confirmButtonText: 'Open',
+    );
+    if (markdownFile == null || markdownFile.path.isEmpty) {
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+      _statusMessage = 'Opening ${markdownFile.name}...';
+    });
+
+    try {
+      final document = await LocalMarkdownLoader.load(markdownFile.path);
+      if (!mounted) return;
+      setState(() {
+        _activeTab
+          ..currentUrl = document.url
+          ..title = document.metadata.title
+          ..document = document
+          ..savedMarkdown = document.markdown
+          ..savedFilePath = markdownFile.path
+          ..viewMode = ViewMode.markdown;
+        _addressController.text = document.url;
+        _htmlController.clear();
+        _markdownController.text = document.markdown;
+        _canGoBack = false;
+        _canGoForward = false;
+        _isLoading = false;
+        _statusMessage = 'Opened local Markdown: ${markdownFile.path}';
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _isLoading = false;
+        _statusMessage = 'Could not open local file: $error';
+      });
+    }
+  }
+
   PageDocument _documentFromMarkdownFile(
     MarkdownImageLocalizationResult result,
   ) {
@@ -2432,6 +2479,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               onBack: _goBack,
               onForward: _goForward,
               onReload: _openAddress,
+              onOpenLocalFile: _openLocalMarkdownFile,
               onSave: _saveCurrentPage,
               onChooseFolder: _chooseLocalFolder,
               onBookmark: _bookmarkCurrentPage,
@@ -2613,6 +2661,54 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       case ViewMode.source:
         return _SourceView(document: document);
     }
+  }
+}
+
+class LocalMarkdownLoader {
+  static Future<PageDocument> load(String filePath) async {
+    final file = File(filePath);
+    if (!await file.exists()) {
+      throw FileSystemException('File does not exist', filePath);
+    }
+
+    final markdown = await file.readAsString();
+    final fileUrl = Uri.file(file.absolute.path).toString();
+    final fileName = file.uri.pathSegments.isEmpty
+        ? file.path
+        : file.uri.pathSegments.last;
+    final outline = RegExp(r'^#{1,6}\s+(.+?)\s*#*$', multiLine: true)
+        .allMatches(markdown)
+        .map((match) => match.group(1)!.trim())
+        .toList(growable: false);
+    final links = RegExp(r'(?<!!)\[[^\]]*\]\((?:<([^>]+)>|([^\s)]+))')
+        .allMatches(markdown)
+        .map((match) => (match.group(1) ?? match.group(2))!)
+        .toSet()
+        .toList(growable: false);
+    final images = RegExp(r'!\[[^\]]*\]\((?:<([^>]+)>|([^\s)]+))')
+        .allMatches(markdown)
+        .map((match) => (match.group(1) ?? match.group(2))!)
+        .toSet()
+        .toList(growable: false);
+
+    return PageDocument(
+      url: fileUrl,
+      rawHtml: '',
+      extractedText: markdown,
+      markdown: markdown,
+      metadata: PageMetadata(
+        title: fileName,
+        description: '',
+        author: '',
+        published: '',
+        sourceUrl: fileUrl,
+        siteName: 'Local Markdown',
+      ),
+      outline: outline,
+      links: links,
+      images: images,
+      warnings: const <String>[],
+    );
   }
 }
 
@@ -3034,6 +3130,7 @@ class _Toolbar extends StatelessWidget {
     required this.onBack,
     required this.onForward,
     required this.onReload,
+    required this.onOpenLocalFile,
     required this.onSave,
     required this.onChooseFolder,
     required this.onBookmark,
@@ -3059,6 +3156,7 @@ class _Toolbar extends StatelessWidget {
   final VoidCallback onBack;
   final VoidCallback onForward;
   final VoidCallback onReload;
+  final VoidCallback onOpenLocalFile;
   final VoidCallback onSave;
   final VoidCallback onChooseFolder;
   final VoidCallback onBookmark;
@@ -3126,6 +3224,11 @@ class _Toolbar extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 8),
+            IconButton(
+              tooltip: 'Open local Markdown file',
+              onPressed: isLoading ? null : onOpenLocalFile,
+              icon: const Icon(Icons.file_open_outlined),
+            ),
             Tooltip(
               message: localSaveDirectory == null
                   ? 'Choose workspace'
