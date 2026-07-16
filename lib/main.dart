@@ -19,6 +19,23 @@ import 'package:webview_flutter_wkwebview/webview_flutter_wkwebview.dart';
 
 const String defaultHomePageUrl = 'https://www.google.com';
 
+class LinuxWindowFocus {
+  static const MethodChannel _channel = MethodChannel(
+    'markdown_browser/window',
+  );
+
+  static Future<void> requestFlutterFocus() async {
+    if (!Platform.isLinux) return;
+    try {
+      await _channel.invokeMethod<void>('requestFlutterFocus');
+    } on PlatformException {
+      // The Linux runner channel is unavailable in some test environments.
+    } on MissingPluginException {
+      // The Linux runner channel is unavailable in some test environments.
+    }
+  }
+}
+
 void main() {
   if (Platform.isLinux) {
     LinuxWebViewPlatform.registerWith();
@@ -3198,6 +3215,7 @@ class _Toolbar extends StatelessWidget {
             Expanded(
               child: TextField(
                 controller: addressController,
+                onTap: () => unawaited(LinuxWindowFocus.requestFlutterFocus()),
                 onSubmitted: (_) => onOpen(),
                 decoration: InputDecoration(
                   isDense: true,

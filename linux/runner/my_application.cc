@@ -1,5 +1,7 @@
 #include "my_application.h"
 
+#include <cstring>
+
 #include <flutter_linux/flutter_linux.h>
 #ifdef GDK_WINDOWING_X11
 #include <gdk/gdkx.h>
@@ -10,6 +12,8 @@
 struct _MyApplication {
   GtkApplication parent_instance;
   char** dart_entrypoint_arguments;
+  FlView* view;
+  FlMethodChannel* window_channel;
 };
 
 G_DEFINE_TYPE(MyApplication, my_application, GTK_TYPE_APPLICATION)
@@ -17,6 +21,36 @@ G_DEFINE_TYPE(MyApplication, my_application, GTK_TYPE_APPLICATION)
 // Called when first Flutter frame received.
 static void first_frame_cb(MyApplication* self, FlView* view) {
   gtk_widget_show(gtk_widget_get_toplevel(GTK_WIDGET(view)));
+}
+
+// Native WebKitGTK widgets take GTK keyboard focus when they are shown.
+// Restore it to Flutter whenever the user clicks the Flutter surface so
+// TextFields outside the WebView can receive keyboard input again.
+static gboolean flutter_view_button_press_cb(GtkWidget* widget,
+                                             GdkEventButton*,
+                                             gpointer) {
+  gtk_widget_grab_focus(widget);
+  return FALSE;
+}
+
+static void window_method_call_cb(FlMethodChannel*,
+                                  FlMethodCall* method_call,
+                                  gpointer user_data) {
+  MyApplication* self = MY_APPLICATION(user_data);
+  g_autoptr(FlMethodResponse) response = nullptr;
+
+  if (strcmp(fl_method_call_get_name(method_call), "requestFlutterFocus") ==
+      0) {
+    gtk_widget_grab_focus(GTK_WIDGET(self->view));
+    response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
+  } else {
+    response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
+  }
+
+  g_autoptr(GError) error = nullptr;
+  if (!fl_method_call_respond(method_call, response, &error)) {
+    g_warning("Failed to respond to window method call: %s", error->message);
+  }
 }
 
 // Implements GApplication::activate.
@@ -59,6 +93,7 @@ static void my_application_activate(GApplication* application) {
       project, self->dart_entrypoint_arguments);
 
   FlView* view = fl_view_new(project);
+  self->view = view;
   GdkRGBA background_color;
   // Background defaults to black, override it here if necessary, e.g. #00000000
   // for transparent.
@@ -79,7 +114,17 @@ static void my_application_activate(GApplication* application) {
   // Requires the view to be realized so we can start rendering.
   g_signal_connect_swapped(view, "first-frame", G_CALLBACK(first_frame_cb),
                            self);
+  g_signal_connect(view, "button-press-event",
+                   G_CALLBACK(flutter_view_button_press_cb), nullptr);
   gtk_widget_realize(GTK_WIDGET(view));
+
+  FlEngine* engine = fl_view_get_engine(view);
+  g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();
+  self->window_channel = fl_method_channel_new(
+      fl_engine_get_binary_messenger(engine), "markdown_browser/window",
+      FL_METHOD_CODEC(codec));
+  fl_method_channel_set_method_call_handler(
+      self->window_channel, window_method_call_cb, self, nullptr);
 
   fl_register_plugins(FL_PLUGIN_REGISTRY(view));
 
@@ -128,6 +173,7 @@ static void my_application_shutdown(GApplication* application) {
 // Implements GObject::dispose.
 static void my_application_dispose(GObject* object) {
   MyApplication* self = MY_APPLICATION(object);
+  g_clear_object(&self->window_channel);
   g_clear_pointer(&self->dart_entrypoint_arguments, g_strfreev);
   G_OBJECT_CLASS(my_application_parent_class)->dispose(object);
 }
