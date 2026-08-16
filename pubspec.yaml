@@ -54,6 +54,13 @@ dev_dependencies:
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
 
+# webview_all_linux 1.2.1 never calls webkit_cookie_manager_set_persistent_storage,
+# so cookies (and login sessions) are lost on every restart on Linux. Vendored
+# copy in third_party/ patches this until it's fixed upstream.
+dependency_overrides:
+  webview_all_linux:
+    path: third_party/webview_all_linux
+
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
 
